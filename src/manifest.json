@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Universal Design Helper",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Annotate a visible webpage and hand off a design change request.",
   "icons": {
     "16": "icons/icon16.png",
@@ -19,6 +19,7 @@
     }
   },
   "permissions": ["activeTab", "scripting", "downloads"],
+  "host_permissions": ["http://127.0.0.1/*"],
   "background": {
     "service_worker": "background.js",
     "type": "module"

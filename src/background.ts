@@ -1,6 +1,9 @@
+import { DESIGN_HELPER_BRIDGE_URL, type BridgeExportPayload } from "./shared/mcp-bridge";
+
 type CaptureMessage = { type: "capture-visible-tab" };
 type DownloadImageMessage = { type: "download-image"; imageUrl: string; imageFilename: string };
-type Message = CaptureMessage | DownloadImageMessage;
+type PostHandoffMessage = { type: "post-design-handoff"; payload: BridgeExportPayload };
+type Message = CaptureMessage | DownloadImageMessage | PostHandoffMessage;
 
 async function setActionError(tabId: number, message: string): Promise<void> {
   await chrome.action.setBadgeText({ tabId, text: "!" });
@@ -46,7 +49,7 @@ async function waitForDownloadFilename(id: number, targetFilename: string): Prom
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
   if (message.type === "capture-visible-tab") {
     const windowId = sender.tab?.windowId ?? chrome.windows.WINDOW_ID_CURRENT;
-    void chrome.tabs.captureVisibleTab(windowId, { format: "png" })
+    void chrome.tabs.captureVisibleTab(windowId, { format: "jpeg", quality: 95 })
       .then((dataUrl) => sendResponse({ ok: true, dataUrl }))
       .catch((error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }));
     return true;
@@ -63,6 +66,23 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
       const savedPath = await waitForDownloadFilename(id, filename);
       sendResponse({ ok: true, id, filename: savedPath });
     }).catch((error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+    return true;
+  }
+  if (message.type === "post-design-handoff") {
+    console.log("[Design Helper] posting handoff to bridge:", DESIGN_HELPER_BRIDGE_URL, message.payload.pageUrl);
+    void fetch(DESIGN_HELPER_BRIDGE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message.payload),
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(`Bridge responded with status ${response.status}`);
+      console.log("[Design Helper] bridge accepted handoff.");
+      sendResponse({ ok: true });
+    }).catch((error: unknown) => {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error("[Design Helper] bridge POST failed:", errorMessage);
+      sendResponse({ ok: false, error: errorMessage });
+    });
     return true;
   }
   return false;

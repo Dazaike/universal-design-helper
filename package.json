@@ -1,12 +1,19 @@
 {
   "name": "universal-design-helper",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "mcp:start": "node mcp-server/dist/index.js",
+    "mcp:shortcut": "powershell -ExecutionPolicy Bypass -File scripts/create-mcp-shortcut.ps1",
+    "mcp:autostart": "powershell -ExecutionPolicy Bypass -File scripts/create-mcp-shortcut.ps1 -Location Startup"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.322",

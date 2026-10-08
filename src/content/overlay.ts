@@ -1,12 +1,18 @@
 import {
   compositeCapture,
+  computeCropBox,
   elementContextFrom,
   formatFilenameTimestamp,
   imageFilename,
+  MAX_CANVAS_SIDE,
+  planCaptureTiles,
   renderHandoffText,
+  type CaptureModel,
+  type CaptureTile,
   type ElementContext,
   type Stroke,
 } from "../shared/export";
+import { type BridgeExportPayload } from "../shared/mcp-bridge";
 
 declare global {
   interface Window {
@@ -48,9 +54,13 @@ function blobToDataUrl(blob: Blob): Promise<string> {
   return promise;
 }
 
-function selectionSummary(context: ElementContext | null): string {
-  return context ? `Target: <${context.tagName}> (${context.cssLocator})` : "No element selected";
+function selectionSummary(contexts: ElementContext[]): string {
+  if (!contexts.length) return "No element selected";
+  if (contexts.length === 1) return `Target: <${contexts[0].tagName}> (${contexts[0].cssLocator})`;
+  return `${contexts.length} targets:\n${contexts.map((c, i) => `${i + 1}. <${c.tagName}> (${c.cssLocator})`).join("\n")}`;
 }
+
+const CAPTURE_INTERVAL_MS = 520;
 
 function mountOverlay(): void {
   if (window[INSTANCE_KEY]) {
@@ -95,6 +105,7 @@ function mountOverlay(): void {
     button.active { background: #0284c7; border-color: #38bdf8; color: #ffffff; }
     button.primary { background: #059669; border-color: #10b981; font-weight: 600; width: 100%; color: #ffffff; }
     button.primary:hover:not(:disabled) { background: #047857; }
+    #dh-alt-mcp-toggle { width: 100%; }
     button.close { margin-left: auto; background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.3); color: #fca5a5; }
     button.close:hover:not(:disabled) { background: #dc2626; color: #fff; border-color: #ef4444; }
     button:disabled { opacity: 0.65; cursor: not-allowed; }
@@ -116,12 +127,12 @@ function mountOverlay(): void {
       display: flex; align-items: center; justify-content: center; padding: 0; line-height: 1;
     }
     .attachment-card .remove-btn:hover { background: #dc2626; }
-    #selection { font-size: 12px; color: #a1a1aa; margin-bottom: 8px; word-break: break-all; }
+    #selection { font-size: 12px; color: #a1a1aa; margin-bottom: 8px; word-break: break-all; white-space: pre-line; max-height: 120px; overflow-y: auto; }
     #status { font-size: 12px; margin-bottom: 10px; min-height: 18px; line-height: 1.4; transition: opacity 0.2s ease; }
     #status.error { color: #fca5a5; font-weight: 500; }
     #status.success { color: #86efac; font-weight: 500; }
     #hover-highlight { display: none; position: fixed; box-sizing: border-box; border: 2px dashed #38bdf8; background: rgba(56, 189, 248, 0.15); pointer-events: none; transition: all 0.05s ease-out; z-index: 5; }
-    #locked-highlight { display: none; position: fixed; box-sizing: border-box; border: 2px solid #00e5ff; background: rgba(0, 229, 255, 0.15); pointer-events: none; z-index: 6; }
+    .locked-highlight { position: fixed; box-sizing: border-box; border: 2px solid #00e5ff; background: rgba(0, 229, 255, 0.15); pointer-events: none; z-index: 6; }
   `;
   const backdrop = document.createElement("div");
   backdrop.id = "backdrop";
@@ -130,8 +141,8 @@ function mountOverlay(): void {
   const canvas = document.createElement("canvas");
   const hoverHighlight = document.createElement("div");
   hoverHighlight.id = "hover-highlight";
-  const lockedHighlight = document.createElement("div");
-  lockedHighlight.id = "locked-highlight";
+  const lockedLayer = document.createElement("div");
+  lockedLayer.id = "locked-layer";
   const toolbar = document.createElement("section");
   toolbar.id = "toolbar";
   toolbar.innerHTML = `
@@ -143,6 +154,9 @@ function mountOverlay(): void {
       <button type="button" data-action="undo">Undo</button>
       <button type="button" class="close" data-action="close">✕</button>
     </div>
+    <div class="row">
+      <button type="button" data-action="toggle-alt-mcp" id="dh-alt-mcp-toggle">Enable Alt+Click + MCP</button>
+    </div>
     <input type="file" id="dh-file-input" accept="image/*" multiple style="display:none" />
     <label for="dh-request">Change Request</label>
     <textarea id="dh-request" placeholder="Describe requested change... (Paste Ctrl+V or drop images)"></textarea>
@@ -151,7 +165,7 @@ function mountOverlay(): void {
     <div id="status" role="status"></div>
     <div class="row"><button type="button" class="primary" data-action="export">Export</button></div>
   `;
-  surface.append(canvas, hoverHighlight, lockedHighlight, toolbar);
+  surface.append(canvas, hoverHighlight, lockedLayer, toolbar);
   shadow.append(style, backdrop, surface);
   (document.body || document.documentElement).append(host);
   const getContext = () => canvas.getContext("2d");
@@ -163,17 +177,25 @@ function mountOverlay(): void {
   const drawButton = toolbar.querySelector<HTMLButtonElement>('[data-mode="draw"]')!;
   const selectButton = toolbar.querySelector<HTMLButtonElement>('[data-mode="select"]')!;
   const exportButton = toolbar.querySelector<HTMLButtonElement>('[data-action="export"]')!;
+  const altMcpButton = toolbar.querySelector<HTMLButtonElement>("#dh-alt-mcp-toggle")!;
 
   let mode: Mode = "idle";
   let strokes: Stroke[] = [];
   let activeStroke: Stroke | null = null;
-  let selected: { element: Element; context: ElementContext } | null = null;
+  let selected: Array<{ element: Element; context: ElementContext }> = [];
   let attachments: AttachedImage[] = [];
   let disposed = false;
+  let altClickMcpEnabled = false;
 
   const showStatus = (message: string, kind: "error" | "success" | "") => {
     status.textContent = message;
     status.className = kind;
+  };
+  const setAltClickMcpEnabled = (enabled: boolean) => {
+    altClickMcpEnabled = enabled;
+    altMcpButton.classList.toggle("active", enabled);
+    altMcpButton.textContent = enabled ? "Alt+Click + MCP: ON" : "Enable Alt+Click + MCP";
+    showStatus(enabled ? "Alt+Click any element to capture it and send it to your coding agent via MCP." : "Alt+Click + MCP disabled.", "");
   };
 
   const addAttachment = (blob: Blob, filename: string) => {
@@ -342,7 +364,11 @@ function mountOverlay(): void {
   const redraw = () => {
     const ctx = getContext();
     if (!ctx) return;
-    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    const dpr = window.devicePixelRatio;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // Strokes live in page coordinates; shift by the current scroll so they stay glued to the content.
+    ctx.setTransform(dpr, 0, 0, dpr, -window.scrollX * dpr, -window.scrollY * dpr);
     ctx.strokeStyle = "#ff2d55";
     ctx.lineWidth = 4;
     ctx.lineCap = "round";
@@ -360,20 +386,29 @@ function mountOverlay(): void {
     const dpr = window.devicePixelRatio;
     canvas.width = Math.round(window.innerWidth * dpr);
     canvas.height = Math.round(window.innerHeight * dpr);
-    const ctx = getContext();
-    if (ctx) {
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      redraw();
-    }
+    redraw();
   };
 
   const updateLockedHighlight = () => {
-    if (!selected || !selected.element.isConnected) {
-      lockedHighlight.style.display = "none";
-      return;
+    lockedLayer.replaceChildren();
+    selected.forEach(({ element }, index) => {
+      if (!element.isConnected) return;
+      const rect = element.getBoundingClientRect();
+      const box = document.createElement("div");
+      box.className = "locked-highlight";
+      box.dataset.index = String(index + 1);
+      box.style.cssText = `left:${rect.x}px;top:${rect.y}px;width:${rect.width}px;height:${rect.height}px;`;
+      lockedLayer.append(box);
+    });
+  };
+  const refreshSelection = () => {
+    selected = selected.filter(({ element }) => element.isConnected);
+    for (const s of selected) {
+      const { x, y, width, height } = s.element.getBoundingClientRect();
+      s.context.rect = { x, y, width, height };
     }
-    const rect = selected.element.getBoundingClientRect();
-    lockedHighlight.style.cssText = `display:block;left:${rect.x}px;top:${rect.y}px;width:${rect.width}px;height:${rect.height}px;`;
+    selectionText.textContent = selectionSummary(selected.map((s) => s.context));
+    updateLockedHighlight();
   };
 
   const isEventOverToolbar = (event: Event): boolean => {
@@ -403,7 +438,13 @@ function mountOverlay(): void {
     drawButton.classList.toggle("active", next === "draw");
     selectButton.classList.toggle("active", next === "select");
     if (next !== "select") hoverHighlight.style.display = "none";
-    if (next === "select") showStatus("Hover & click any element on the page.", "");
+    if (next === "select") showStatus("Click elements to select or deselect them. Click Select element again when done.", "");
+  };
+
+  const handleScroll = () => {
+    if (disposed) return;
+    updateLockedHighlight();
+    redraw();
   };
 
   const close = () => {
@@ -414,8 +455,11 @@ function mountOverlay(): void {
     window.removeEventListener("pointerup", stopDragging);
     window.removeEventListener("pointercancel", stopDragging);
     window.removeEventListener("resize", resizeCanvas);
+    window.removeEventListener("resize", handleScroll);
+    window.removeEventListener("scroll", handleScroll, true);
     document.removeEventListener("pointermove", handlePointerHover, true);
-    document.removeEventListener("click", selectElement, true);
+    PRESS_EVENTS.forEach((name) => window.removeEventListener(name, swallowPagePress, true));
+    document.removeEventListener("click", handlePageClick, true);
     document.removeEventListener("paste", handlePaste, true);
     canvas.removeEventListener("pointerdown", beginStroke);
     canvas.removeEventListener("pointermove", extendStroke);
@@ -426,19 +470,63 @@ function mountOverlay(): void {
     host.remove();
   };
 
-  const selectElement = (event: MouseEvent) => {
-    if (mode !== "select" || disposed) return;
+  const sendSelectionToMcp = async (contexts: ElementContext[]) => {
+    showStatus("Element selected via Alt+Click. Sending to MCP…", "");
+    try {
+      const bridgePayload: BridgeExportPayload = {
+        imagePaths: [],
+        request: requestInput.value.trim(),
+        elementContexts: contexts,
+        pageUrl: location.href,
+        timestamp: new Date().toISOString(),
+        images: [],
+      };
+      const bridgeResult = await sendMessage<{ ok: true } | { ok: false; error: string }>({
+        type: "post-design-handoff",
+        payload: bridgePayload,
+      });
+      if (bridgeResult.ok) {
+        showStatus("Element selected. Sent to MCP.", "success");
+      } else {
+        showStatus(`Element selected, but MCP send failed: ${bridgeResult.error}`, "error");
+      }
+    } catch (error) {
+      showStatus(`Element selected, but MCP send failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  };
+
+  // Page menus/popovers close on pointerdown/mousedown (outside-click). Swallow the press
+  // events in select mode so only our click handler sees the interaction.
+  const swallowPagePress = (event: Event) => {
+    if (disposed || mode !== "select") return;
+    if (isEventOverToolbar(event)) return;
+    event.stopImmediatePropagation();
+    event.preventDefault();
+  };
+  const PRESS_EVENTS = ["pointerdown", "pointerup", "mousedown", "mouseup", "touchstart", "touchend"] as const;
+
+  const handlePageClick = (event: MouseEvent) => {
+    if (disposed) return;
+    const altTrigger = altClickMcpEnabled && event.altKey;
+    if (mode !== "select" && !altTrigger) return;
     if (isEventOverToolbar(event)) return;
     const target = document.elementFromPoint(event.clientX, event.clientY);
     if (!target || target === host || host.contains(target) || target === document.documentElement || target === document.body) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    selected = { element: target, context: elementContextFrom(target, location.href, host) };
-    selectionText.textContent = selectionSummary(selected.context);
-    hoverHighlight.style.display = "none";
-    setMode("idle");
-    updateLockedHighlight();
-    showStatus("Element selected.", "success");
+    const existing = selected.findIndex((s) => s.element === target);
+    if (existing !== -1) {
+      selected.splice(existing, 1);
+    } else {
+      selected.push({ element: target, context: elementContextFrom(target, location.href, host) });
+    }
+    refreshSelection();
+    const contexts = selected.map((s) => s.context);
+    if (altTrigger) {
+      void sendSelectionToMcp(contexts);
+    } else {
+      showStatus(existing !== -1 ? `Deselected. ${contexts.length} selected.` : `${contexts.length} selected.`, "success");
+    }
   };
 
   const beginStroke = (event: PointerEvent) => {
@@ -446,7 +534,7 @@ function mountOverlay(): void {
     event.preventDefault();
     event.stopPropagation();
     canvas.setPointerCapture(event.pointerId);
-    activeStroke = { points: [{ x: event.clientX, y: event.clientY }] };
+    activeStroke = { points: [{ x: event.clientX + window.scrollX, y: event.clientY + window.scrollY }] };
     strokes.push(activeStroke);
     redraw();
   };
@@ -454,7 +542,7 @@ function mountOverlay(): void {
   const extendStroke = (event: PointerEvent) => {
     if (!activeStroke) return;
     event.preventDefault();
-    activeStroke.points.push({ x: event.clientX, y: event.clientY });
+    activeStroke.points.push({ x: event.clientX + window.scrollX, y: event.clientY + window.scrollY });
     redraw();
   };
 
@@ -467,90 +555,127 @@ function mountOverlay(): void {
 
   const exportChanges = async () => {
     const request = requestInput.value.trim();
-    if (!request && !selected && !strokes.length && !attachments.length) {
+    refreshSelection();
+    if (!request && !selected.length && !strokes.length && !attachments.length) {
       requestInput.focus();
       showStatus("Add a request, stroke, element, or image first.", "error");
       return;
     }
-    if (selected && !selected.element.isConnected) {
-      selected = null;
-      selectionText.textContent = "No element selected";
-      lockedHighlight.style.display = "none";
-    }
+    const elementContexts = selected.map((s) => s.context);
     const timestamp = new Date();
-    const model = {
+    const scrollX0 = window.scrollX;
+    const scrollY0 = window.scrollY;
+    const model: CaptureModel = {
       request,
       pageUrl: location.href,
       timestamp,
       viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio },
+      page: {
+        width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0),
+        height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0),
+      },
+      scroll: { x: scrollX0, y: scrollY0 },
       strokes,
-      elementContext: selected?.context ?? null,
+      elementRects: selected.map(({ context: { rect } }) => ({ x: rect.x + scrollX0, y: rect.y + scrollY0, width: rect.width, height: rect.height })),
     };
+    const crop = computeCropBox(model);
+    if (crop.width * model.viewport.devicePixelRatio > MAX_CANVAS_SIDE || crop.height * model.viewport.devicePixelRatio > MAX_CANVAS_SIDE) {
+      showStatus("Selection spans too much of the page for one image. Select a smaller span.", "error");
+      return;
+    }
 
     exportButton.disabled = true;
     exportButton.innerHTML = `<span class="spinner"></span> Processing...`;
     showStatus("Exporting & capturing webpage...", "");
 
-    let captureDataUrl: string | null = null;
     try {
-      surface.classList.add("capturing");
-      backdrop.classList.add("capturing");
-      canvas.style.opacity = "0";
-      toolbar.style.opacity = "0";
-      backdrop.style.opacity = "0";
-      hoverHighlight.style.opacity = "0";
-      lockedHighlight.style.opacity = "0";
-      const { promise: painted, resolve: resolvePainted } = Promise.withResolvers<void>();
-      requestAnimationFrame(() => requestAnimationFrame(() => resolvePainted()));
-      await painted;
-      const capture = await sendMessage<CaptureResponse>({ type: "capture-visible-tab" });
-      if (!capture.ok) throw new Error(capture.error);
-      captureDataUrl = capture.dataUrl;
-    } finally {
-      canvas.style.opacity = "1";
-      toolbar.style.opacity = "1";
-      backdrop.style.opacity = "1";
-      hoverHighlight.style.opacity = "1";
-      lockedHighlight.style.opacity = "1";
-      surface.classList.remove("capturing");
-      backdrop.classList.remove("capturing");
-    }
+      const tiles: CaptureTile[] = [];
+      const seen = new Set<string>();
+      let lastCaptureAt = 0;
+      // !important so it beats the inline `all: initial` on the host.
+      host.style.setProperty("display", "none", "important");
+      try {
+        for (const position of planCaptureTiles(crop, model.viewport)) {
+          window.scrollTo({ left: position.x, top: position.y, behavior: "instant" });
+          const key = `${window.scrollX},${window.scrollY}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const { promise: painted, resolve: resolvePainted } = Promise.withResolvers<void>();
+          requestAnimationFrame(() => requestAnimationFrame(() => resolvePainted()));
+          await painted;
+          // captureVisibleTab is rate limited (~2 calls/s); also lets lazy content settle after scrolling.
+          const wait = Math.max(100, CAPTURE_INTERVAL_MS - (Date.now() - lastCaptureAt));
+          const { promise: settled, resolve: resolveSettled } = Promise.withResolvers<void>();
+          setTimeout(resolveSettled, wait);
+          await settled;
+          const capture = await sendMessage<CaptureResponse>({ type: "capture-visible-tab" });
+          lastCaptureAt = Date.now();
+          if (!capture.ok) throw new Error(capture.error);
+          tiles.push({ blob: await (await fetch(capture.dataUrl)).blob(), scrollX: window.scrollX, scrollY: window.scrollY });
+        }
+      } finally {
+        window.scrollTo({ left: scrollX0, top: scrollY0, behavior: "instant" });
+        host.style.removeProperty("display");
+      }
 
-    try {
-      const imageBlob = await compositeCapture(await (await fetch(captureDataUrl)).blob(), model);
+      const imageBlob = await compositeCapture(tiles, model);
       const imageName = imageFilename(timestamp);
+      const imageDataUrl = await blobToDataUrl(imageBlob);
 
       const websiteImageDownload = await sendMessage<DownloadResponse>({
         type: "download-image",
-        imageUrl: await blobToDataUrl(imageBlob),
+        imageUrl: imageDataUrl,
         imageFilename: imageName,
       });
       if (!websiteImageDownload.ok) throw new Error(`PNG download failed: ${websiteImageDownload.error}`);
 
       const imagePaths: string[] = [websiteImageDownload.filename];
+      const bridgeImages: BridgeExportPayload["images"] = [{ filename: imageName, dataUrl: imageDataUrl }];
 
       for (let i = 0; i < attachments.length; i++) {
         const att = attachments[i];
         const ext = att.filename.endsWith(".jpg") || att.filename.endsWith(".jpeg") ? "jpg" : "png";
         const attFilename = `${formatFilenameTimestamp(timestamp)}-attachment-${i + 1}.${ext}`;
+        const attDataUrl = await blobToDataUrl(att.blob);
         const attDownload = await sendMessage<DownloadResponse>({
           type: "download-image",
-          imageUrl: await blobToDataUrl(att.blob),
+          imageUrl: attDataUrl,
           imageFilename: attFilename,
         });
         if (attDownload.ok) {
           imagePaths.push(attDownload.filename);
+          bridgeImages.push({ filename: attFilename, dataUrl: attDataUrl });
         }
       }
 
-      const handoffText = renderHandoffText(imagePaths, request, selected?.context ?? null);
+      const handoffText = renderHandoffText(imagePaths, request, elementContexts);
       let clipboardMessage = "Handoff copied to clipboard!";
       try {
         await navigator.clipboard.writeText(handoffText);
       } catch {
         clipboardMessage = "Images saved, but clipboard write failed.";
       }
-      showStatus(`${clipboardMessage} Saved ${imagePaths.length} image(s) to Downloads.`, "success");
+
+      let bridgeSuffix = "";
+      try {
+        const bridgePayload: BridgeExportPayload = {
+          imagePaths,
+          request,
+          elementContexts,
+          pageUrl: location.href,
+          timestamp: timestamp.toISOString(),
+          images: bridgeImages,
+        };
+        const bridgeResult = await sendMessage<{ ok: true } | { ok: false; error: string }>({
+          type: "post-design-handoff",
+          payload: bridgePayload,
+        });
+        if (bridgeResult.ok) bridgeSuffix = " MCP bridge updated.";
+      } catch {
+        // MCP bridge server isn't running; the download and clipboard handoff already succeeded.
+      }
+
+      showStatus(`${clipboardMessage} Saved ${imagePaths.length} image(s) to Downloads.${bridgeSuffix}`, "success");
     } catch (error) {
       showStatus(`Export failed: ${error instanceof Error ? error.message : String(error)}`, "error");
     } finally {
@@ -569,9 +694,13 @@ function mountOverlay(): void {
       fileInput.click();
       return;
     }
+    if (button.dataset.action === "toggle-alt-mcp") {
+      setAltClickMcpEnabled(!altClickMcpEnabled);
+      return;
+    }
     if (button.dataset.action === "undo") {
       if (strokes.length) strokes = strokes.slice(0, -1);
-      else if (selected) { selected = null; selectionText.textContent = "No element selected"; lockedHighlight.style.display = "none"; }
+      else if (selected.length) { selected.pop(); refreshSelection(); }
       redraw();
       return;
     }
@@ -580,8 +709,11 @@ function mountOverlay(): void {
   };
 
   window.addEventListener("resize", resizeCanvas);
+  window.addEventListener("resize", handleScroll);
+  window.addEventListener("scroll", handleScroll, { capture: true, passive: true });
   document.addEventListener("pointermove", handlePointerHover, true);
-  document.addEventListener("click", selectElement, true);
+  PRESS_EVENTS.forEach((name) => window.addEventListener(name, swallowPagePress, true));
+  document.addEventListener("click", handlePageClick, true);
   document.addEventListener("paste", handlePaste, true);
   canvas.addEventListener("pointerdown", beginStroke);
   canvas.addEventListener("pointermove", extendStroke);

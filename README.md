@@ -32,3 +32,18 @@ npm test
 1. Navigate to `chrome://extensions/` in Chrome.
 2. Enable **Developer mode** (top right).
 3. Click **Load unpacked** and select the project's `dist/` directory.
+
+## MCP Server (Alt+Click Handoff)
+
+The extension can hand off a selected element directly to a coding agent via [MCP](https://modelcontextprotocol.io), bypassing the download/clipboard flow. Enable **Alt+Click + MCP** in the toolbar, then Alt+Click any element to send its context straight to the `get_pending_design_request` tool.
+
+This requires the bundled bridge server (`mcp-server/dist/index.js`) to be reachable on `127.0.0.1:7420`. An MCP client (e.g. OMP, configured with `command: node`, `args: ["<repo>/mcp-server/dist/index.js"]`) spawns this automatically while connected. To run it standalone - e.g. after a reboot, without an agent session active - create a shortcut:
+
+```bash
+npm run build          # produces mcp-server/dist/index.js
+npm run mcp:shortcut   # creates "Design Helper MCP Server.lnk" in your Downloads folder
+npm run mcp:autostart  # installs the same shortcut into the Windows Startup folder
+```
+
+`mcp:shortcut` is for manual double-click launch. `mcp:autostart` makes the bridge start automatically on every login, independent of whether OMP (or any other MCP client) is running - useful since OMP only spawns the server while it's actively connected, not at boot.
+
